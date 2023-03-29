@@ -1,0 +1,890 @@
+---
+title: "Tarea 2 - Economía Computacional"
+author: "Grupo 5 (Luis, Mario, Pablo, Raymundo)"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+header-includes:
+  - \usepackage{placeins}
+  - \usepackage{rotating}
+output: 
+  pdf_document:
+    latex_engine: xelatex
+    toc: TRUE
+    toc_depth: 3
+    number_sections: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.height = 4,
+	fig.width = 6,
+	message = FALSE,
+	warning = FALSE,
+	cache = FALSE,
+	digits = 3,
+	width = 48
+)
+
+knitr::opts_chunk$set(echo = TRUE)
+knitr::knit_hooks$set(plot = function(x, options)  {
+  paste0(knitr::hook_plot_tex(x, options), "\n\\FloatBarrier\n")
+})
+```
+
+```{r librerias_lectura, include=FALSE, warning=FALSE}
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+library(bootstrap)
+library(sandwich)
+library(equatiomatic)
+library(car)
+library(stargazer)
+library(quantreg)
+library(caret)
+library(margins)
+library(nnet)
+library(mlogit)
+library(RCT)
+library(leebounds)
+library(devtools)
+library(Matching)
+library(EnvStats)
+library(tidyverse)
+library(broom)
+library(lubridate)
+library(gamlr)
+library(ranger)
+library(tree)
+library(parallel)
+library(tidymodels)
+library(ROSE)
+library(rpart)
+library(rpart.plot)
+library(xgboost)
+library(patchwork)
+library(gains)
+library(CustomerScoringMetrics)
+library(pracma)
+wd <- "C:/Users/mario/OneDrive/ITAM/2DO SEMESTRE/Economia Computacional/Tareas/Tarea2"
+setwd(wd)
+set.seed(156940)
+options(scipen=999)
+datos <- load('Cell2Cell.Rdata')
+```
+
+# Datos
+
+## Missing Values.
+Las columnas con missing values son los siguientes. 
+
+```{r datos1, echo = TRUE, warning = FALSE}
+names(which(colSums(is.na(cell2cell))>0))
+#table(cell2cell$churn)
+kable(prop.table(table(cell2cell$churn)), caption = "Proporción original (Pre-NA)")
+
+# Omitimos observaciones con NA en las primeras 6 variables mencionadas
+cell2cell_rev <-
+  dplyr::filter(cell2cell, !is.na(revenue))
+
+# Omitimos observaciones con NA en changem/changer
+cell2cell_change <-
+  dplyr::filter(cell2cell_rev, !is.na(changem))
+
+# Omitimos observacion con NA en phone/models/eqpdays
+cell2cell_phone <-
+  dplyr::filter(cell2cell_change, !is.na(phones))
+
+# Colocamos "0" en observaciones con NA en "age1-age2"
+cell2cell_phone[is.na(cell2cell_phone)]<-0
+```
+
+- **revenue, mou, recchrge, directas, overage, roam:**  Columnas que tienen 216 observaciones con NA. Todas ellas comparten los mismos registros, decidimos eliminar el total de registros ya que consideramos que al ser calculada sobre los 4 meses anteriores podrían ser nuevos usuarios; sin embargo, al tener el resto de variables de "promedio" pobladas no podemos determinar cómo poblar la variable. Las observaciones **no son ni el 1%** del total de registros por lo que no estaremos perdiendo una cantidad importante de información. 
+
+- **changem, changer:** 286 registros adicionales. Si la variable $overage = 0$ la variable es NA dado que no hay registro de uso por el usuario. Para los $overage \ne 0$ es probable que durante los 4 meses anteriores no hayan usado su dispositivo o bien, son nuevos. Por lo que la variable tampoco es calculable. 
+
+- **Phones, models, eqpdays:**  1 registro. Se omite, no causará mayor ruido
+
+- **Age1, Age2:** 1235 registros adicionales. Hay varios registros con ambos campos en 0 (19,164) al no poder determinar un valor más preciso no vemos ningún inconveniente en considerar estos con dicho valor. 
+
+Por lo que en total eliminamos 503 registros, <1% del total, respecto a la proporción de *churn* no se ve afectada, se mantiene la relación ( 71(0) - 29(1) )
+
+## Proporción *churn* (Oversampling/Undersampling)
+
+```{r datos2, echo = TRUE, warning = FALSE}
+datos_sin_na <- cell2cell_phone
+rm(cell2cell_change,cell2cell_phone,cell2cell_rev)
+tabla1 <- as.data.frame(table(datos_sin_na$churn))
+tabla2 <- as.data.frame(prop.table(table(datos_sin_na$churn)))
+tabla_prop <- left_join(tabla1, tabla2, by = "Var1")
+names(tabla_prop) <- c("Churn","N","Prop")
+
+kable(tabla_prop, caption = "Proporción original (Post-NA)")
+```
+
+Tenemos un buen número de observaciones por lo que bien podríamos hacer undersampling; sin embargo, para tomar la decisión veremos la distribución de algunas variables numéricas. La intensión es ver qué tanta variabilidad tenemos, si hay mucho valdría la pena mantener y hacer oversampling (información sintética), si no, undersampling
+
+```{r datos2-hist, echo = TRUE, warning=FALSE, fig.cap = "Histograma de variables"}
+datos_sin_na %>% 
+  dplyr::select(revenue, mou,age1,age2, recchrge, 
+                directas, overage,changem, changer, 
+                retaccpt,creditcd,retcalls) %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram()
+```
+Observamos poca variabilidad en general, decidimos **undersampling**
+
+## (2 pts) Train/Test - Oversampling/Undersampling
+
+```{r datos3, echo = TRUE, warning = FALSE}
+data_training <- 
+  datos_sin_na %>%
+  dplyr::slice_sample(prop = 0.8)
+
+kable(prop.table(table(data_training$churn)),caption = "Proporcion 'churn' train set")
+
+data_test <- 
+  datos_sin_na %>%
+  dplyr::filter(!(customer %in% data_training$customer))
+
+kable(prop.table(table(data_test$churn)),caption = "Proporcion 'churn' test set")
+```
+
+Observamos que la proporción (79-21) se respeta en ambos conjuntos. Ahora aplicaremos **undersampling** por lo mostrado en el inciso anterior. Además presentamos los mismos histogramas para corroborar nuestra hipótesis de que se respetarían la varianza respecto lo original. (N train = 56435//N Balanced = 32706)
+
+```{r datos3-under, echo= TRUE, warning = FALSE, fig.cap = "Histograma de variables con dataset balanceado"}
+train_balanced <- ovun.sample(churn ~ ., data = data_training, 
+                              method = "under", seed = 156940)$data
+
+kable(prop.table(table(train_balanced$churn)),
+      caption = "Proporcion 'churn' balanced train set")
+
+train_balanced %>% 
+  dplyr::select(revenue, mou,age1,age2, recchrge, 
+                directas, overage,changem, changer, 
+                retaccpt,creditcd,retcalls) %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram()
+```
+
+# Model estimation
+
+Pondremos a competir 3 modelos: 
+
+- Cross-Validated LASSO-logit
+- Prune Trees
+- Random Forest
+- Gradient Boosting Machine 
+
+## LOGIT LASSO
+
+### (2 pts) CV LASSO. Muestra el la gráfica de CV Binomial Deviance vs Complejidad
+```{r modelo-lasso, echo = TRUE, warning = FALSE, fig.cap = 'Binomial Deviance vs. Complejidad'}
+Xs <- 
+  train_balanced %>% 
+  dplyr::select(., -c(customer,churn))
+
+Xs <- 
+  sparse.model.matrix(~. + 0, data = Xs)
+
+y <- train_balanced$churn
+
+cl <- makeCluster(detectCores())
+
+lasso <- cv.gamlr(x = Xs, y = y, verb = T, cl = cl, 
+                  family = 'binomial')
+
+#lasso_mod <- glmnet(Xs,y)#, lambda = lasso$lambda.min)
+
+stopCluster(cl)
+
+#save(lasso, file = 'cv_lasso.Rdata')
+load('cv_lasso.Rdata')
+plot(lasso, main = "Binomial Deviance vs. Complejidad")
+```
+\FloatBarrier
+
+### Lasso de los coeficientes vs la complejidad del modelo.  
+```{r modelo-lasso2, echo = TRUE, warning = FALSE, fig.cap= 'Pathway Lasso vs. Complejidad'}
+plot(lasso$gamlr, main = "Pathway Lasso vs. Complejidad")
+```
+\FloatBarrier
+
+### (2 pts). $\lambda$ resultante // Coeficientes Lasso // Importancia
+
+El lambda resultante que minimiza el error OOS es **`r lasso$lambda.min`** A continuación mostramos dos tablas; la primera, con el nombre de las variables que el coeficiente es mandado a 0; la segunda, con los coeficientes obtenidos para el total de variables.
+
+De acuerdo a la magnitud del coeficiente (en valor absoluto) las 3 variables con mayor importancia son: 
+
+- **creditaa:** Buenos historiales crediticios, cumplimiento y buena organización. Podría estar relacionado a una buena capacidad de pago por lo que no tendrá inconveniente de seguir pagando el servicio. 
+- **retcalls:** Nos indica si existe un alto índice de llamadas del cliente al equipo de atención, puede implicar inconformidad con el servicio y una posible cancelación por ofertas de competencia
+- **retcall:** Nos indica si existieron llamadas del cliente al equipo de atención. La magnitud estará dada por *retcalls*
+
+```{r lasso3, echo = TRUE, warning = FALSE}
+coef_lasso <- coef(lasso, select = "min")
+coef_lasso_table <- as.data.frame(sort(coef_lasso[,]))
+names(coef_lasso_table) <- "Coeficiente"
+
+variables_cero <- as.data.frame(rownames(dplyr::filter(coef_lasso_table, 
+                                                       Coeficiente == 0)))
+names(variables_cero) <- "Variable"
+
+kable(variables_cero,
+      caption = "Variables que el algoritmo manda a 0")
+
+kable(coef_lasso_table, 
+      caption = "Coeficientes cv.lasso lambda min OOS")
+```
+\FloatBarrier
+
+### Predicciones CV.LASSO
+Generamos un data frame que almacena el customer_id, el valor real de la variable *churn* y nuestra predicción por logit lasso
+
+```{r lasso4-predict, echo = TRUE, warning = FALSE}
+
+data_test$lasso <- predict(lasso, 
+                           newdata = data_test[,-c(1,2)],
+                           type = 'response',
+                           select = 'min')[,1]
+
+df_eval <- 
+  dplyr::select(data_test, customer, churn, lasso)
+```
+
+## TREE
+
+### Estimación Tree (`mindev = 0.05, mincut = 1000`) y Gráfica
+Cuántos nodos? Solo hay 2 nodos terminales. Los parámetros colocados en el árbol parecieran ser demasiado restrictivos ya que no dejan crecer nuestro árbol más allá de eso. (Pasamos las variables dummy a factor para que se detecte como un árbol de clasificación y no de regresión). 
+
+```{r tree1, echo = FALSE, warning = FALSE}
+data_training_tree <-
+  train_balanced %>%
+  dplyr::mutate(churn = factor(churn, levels = c("1","0")),
+                credita = factor(credita, levels = c("1","0")),
+                creditaa = factor(creditaa, levels = c("1","0")),
+                prizmrur = factor(prizmrur, levels = c("1","0")),
+                children = factor(children, levels = c("1","0")),
+                prizmub = factor(prizmub, levels = c("1","0")),
+                prizmtwn = factor(prizmtwn, levels = c("1","0")),
+                refurb = factor(refurb, levels = c("1","0")),
+                webcap = factor(webcap, levels = c("1","0")),
+                truck = factor(truck, levels = c("1","0")),
+                rv = factor(rv, levels = c("1","0")),
+                occprof = factor(occprof, levels = c("1","0")),
+                occcler = factor(occcler, levels = c("1","0")),
+                occcrft = factor(occcrft, levels = c("1","0")),
+                occstud = factor(occstud, levels = c("1","0")),
+                occhmkr = factor(occhmkr, levels = c("1","0")),
+                occret = factor(occret, levels = c("1","0")),
+                occself = factor(occself, levels = c("1","0")),
+                ownrent = factor(ownrent, levels = c("1","0")),
+                marryun = factor(marryun, levels = c("1","0")),
+                marryyes = factor(marryyes, levels = c("1","0")),
+                mailord = factor(mailord, levels = c("1","0")),
+                mailres = factor(mailres, levels = c("1","0")),
+                mailflag = factor(mailflag, levels = c("1","0")),
+                travel = factor(travel, levels = c("1","0")),
+                pcown = factor(pcown, levels = c("1","0")),
+                creditcd = factor(creditcd, levels = c("1","0")),
+                newcelly = factor(newcelly, levels = c("1","0")),
+                newcelln = factor(newcelln, levels = c("1","0")),
+                incmiss = factor(incmiss, levels = c("1","0")),
+                mcycle = factor(mcycle, levels = c("1","0")),
+                setprcm = factor(setprcm, levels = c("1","0")),
+                retcall = factor(retcall, levels = c("1","0")))
+
+data_test_tree <-
+  data_test %>%
+  dplyr::mutate(churn = factor(churn, levels = c("1","0")),
+                credita = factor(credita, levels = c("1","0")),
+                creditaa = factor(creditaa, levels = c("1","0")),
+                prizmrur = factor(prizmrur, levels = c("1","0")),
+                children = factor(children, levels = c("1","0")),
+                prizmub = factor(prizmub, levels = c("1","0")),
+                prizmtwn = factor(prizmtwn, levels = c("1","0")),
+                refurb = factor(refurb, levels = c("1","0")),
+                webcap = factor(webcap, levels = c("1","0")),
+                truck = factor(truck, levels = c("1","0")),
+                rv = factor(rv, levels = c("1","0")),
+                occprof = factor(occprof, levels = c("1","0")),
+                occcler = factor(occcler, levels = c("1","0")),
+                occcrft = factor(occcrft, levels = c("1","0")),
+                occstud = factor(occstud, levels = c("1","0")),
+                occhmkr = factor(occhmkr, levels = c("1","0")),
+                occret = factor(occret, levels = c("1","0")),
+                occself = factor(occself, levels = c("1","0")),
+                ownrent = factor(ownrent, levels = c("1","0")),
+                marryun = factor(marryun, levels = c("1","0")),
+                marryyes = factor(marryyes, levels = c("1","0")),
+                mailord = factor(mailord, levels = c("1","0")),
+                mailres = factor(mailres, levels = c("1","0")),
+                mailflag = factor(mailflag, levels = c("1","0")),
+                travel = factor(travel, levels = c("1","0")),
+                pcown = factor(pcown, levels = c("1","0")),
+                creditcd = factor(creditcd, levels = c("1","0")),
+                newcelly = factor(newcelly, levels = c("1","0")),
+                newcelln = factor(newcelln, levels = c("1","0")),
+                incmiss = factor(incmiss, levels = c("1","0")),
+                mcycle = factor(mcycle, levels = c("1","0")),
+                setprcm = factor(setprcm, levels = c("1","0")),
+                retcall = factor(retcall, levels = c("1","0")))
+```
+
+```{r tree-model, echo = TRUE, warning = FALSE}
+tree <- rpart(churn ~ ., 
+              data = data_training_tree[,-c(1)], 
+              method = "class",
+              cp = 0.05, minsplit = 1000)
+              #control = rpart.control(minsplit = 1000, cp = 0.05))
+summary(tree)
+rpart.plot(tree, digits = 2)
+```
+
+
+### Pruned Tree 
+Para podar un árbol es recomendable utilizar parámetros más flexibles, para que el árbol pueda crecer y consideremos la mayor cantidad de cortes utilizaremos los siguientes parámetros `mindev = 0.0005`. De acuerdo a nuestra gráfica aumentar el **tamaño del árbol** más allá de dos no ayuda a una disminución en la *Binomial Deviance*, por lo que "simple is better" diremos que el mejor árbol será el de tamaño 2. El resultado es el mismo árbol obtenido en el inciso anterior, por lo que no mejora ni empeora el error. 
+
+```{r tree2-prunned, echo = TRUE, warning = FALSE, fig.cap = 'Binomial Deviance vs. Tree Size'}
+tree_prune <- tree::tree(churn ~ ., 
+              data = data_training_tree[,-c(1)], 
+              mindev = 0.0005)
+cv_tree <- cv.tree(tree_prune, K = 5)
+
+size <- cv_tree$size
+bin_deviance <- cv_tree$dev
+
+cv_plot <- as.data.frame(cbind(size, bin_deviance))
+
+ggplot(data=cv_plot, aes(x=size, y=bin_deviance)) +
+  geom_line()+
+  geom_point()+
+  theme_minimal()+
+  labs(title = "Binomial Deviance vs. Tree Size", 
+       y = "Binomial Deviance", x = "Tree Size")
+```
+
+### Gráfica del Pruned Tree
+
+```{r tree3-error, echo = TRUE, warning = FALSE}
+pruned_tree <- prune.tree(tree_prune, best = 2)
+plot(pruned_tree)
+text(pruned_tree, pretty = 0)
+save(pruned_tree, file = 'pruned_tree.Rdata')
+#save(lasso, file = 'cv_lasso.Rdata')
+load('pruned_tree.Rdata')
+```
+
+### Predicciones con Prune Tree
+```{r tree4-predicciones, echo = TRUE, warning = FALSE}
+pred_prob_tree <- as.data.frame(predict(pruned_tree, 
+                                newdata = data_test_tree,
+                                type = 'vector')[,1])
+names(pred_prob_tree) <- "prob_tree"
+
+pred_churn_tree <- as.data.frame(predict(pruned_tree, 
+                                newdata = data_test_tree,
+                                type = 'class'))
+names(pred_churn_tree) <- "group_tree"
+
+
+df_eval <- 
+  dplyr::select(data_test, customer, churn, lasso)
+
+df_eval <- cbind(df_eval, pred_prob_tree, pred_churn_tree)
+kable(head(df_eval, n=3))
+```
+
+## RANDOM FOREST
+
+### Entrenar modelo (RF)
+Entrenaremos un RF siguiendo los siguientes lineamientos.
+
+- Corre para `num.trees=100,200,300, 500, 700, 800`
+- En cada caso, guarda únicamente el `prediction.error`
+
+A continuación mostramos una tabla con la relación Número de árboles - Predicted Error. Escogeremos un RF de tamaño 300, dado que la disminución en el error no parece ser tan significativa después del cambio de 100-200.  
+
+```{r rf-1, echo = TRUE, warning = FALSE}
+cl <- makeCluster(detectCores())
+Bs <- c(100,200,300,500,700,800)
+pred.error.rf <- c()
+for (B in Bs) {
+  rf <- ranger(churn~., data = data_training_tree[,-c(1)], 
+               probability = T, num.trees = B, importance = "impurity")
+  a <- rf$prediction.error
+  pred.error.rf <- rbind(pred.error.rf, a)
+}
+stopCluster(cl)
+table.rf <- as.data.frame(cbind(Bs, pred.error.rf))
+names(table.rf) <- c("Num.Trees", "Predicted.Error")
+rownames(table.rf) <- NULL
+kable(table.rf, caption = "Num.Trees - Predicted.Error")
+```
+
+### Importancia de Variables (RF: `num.trees = 300`)
+La medida de importancia será cuánto reduzcan respecto a la medida de impureza utilizada, en este caso Índice de Gini
+
+- **eqpdays(1):** Alguien con una mayor antiguedad esperarías que mantuviera su "lealtad" a la compañía
+- **changem(2):** Aunque tenga alto promedio de uso, puede que recientemente haya cambiado sus preferencias por lo que es importante tenerlo en mente
+- **mou(3):** Intuitivamente es algo similar a la de `changem`. Dado que si el promedio de minutos usados es bajo podría suponerse un próxima cancelación 
+- **changer(4):** Reducciones de ingreso pueden implicar reducción de gastos, cancelación del servicio
+- **months(5):** Una mayor cantidad de meses con el equipo puede hablar de cierta "lealtad"
+- **peakvce/opeakvce (6-7):** Promedio de minutos en las llamadas. Mayor número está relacionado a un mayor uso y habla de una menor intención de cancelar la línea. 
+
+```{r rf-2, echo = TRUE, warning=FALSE,, fig.cap = "Variable Importance (Gini) Top 15"}
+rf_f <- ranger(churn~., data = data_training_tree[,-c(1)], 
+               probability = T, num.trees = 300, importance = "impurity")
+#save(rf_f, file = 'RF_model.Rdata')
+load('RF_model.Rdata')
+
+var.importance <- as.data.frame(rf_f$variable.importance)
+var.importance$variable <- rownames(var.importance)
+names(var.importance) <- c("Importance","Variable")
+var.importance <- var.importance[order(var.importance$Importance, decreasing = T),]
+
+ggplot(var.importance %>% head(15), aes(x=reorder(Variable, Importance), 
+                           y=Importance)) +
+  geom_bar(stat="identity", fill="#f68060", alpha=.6, width=.4) +
+  coord_flip() +
+  labs(title = "Variable Importance (Top 15)", 
+       x = "Variable", 
+       y = "Importance (Gini)") +
+  theme_bw()
+```
+
+### Predicciones Random Forest
+```{r rf-4predicciones, echo = TRUE, warning = FALSE}
+df_eval$rf <- predict(rf_f, 
+                        data = data_test_tree,
+                        type = 'response')$predictions[,1]
+```
+
+## GBM (XGBOOST)
+
+### Estimación
+
+- Encuenta el número de boosting rounds ideal $B$ (`nrounds`)
+- Encuentra la profundidad de los árboles $d$ (`max_depth`)
+- Estima un grid de modelos para calibrar los dos hiperparámetros
+
+El siguiente código muestra nuestro procedimiento de hyper tunning parameters. Lo realizamos por medio de la paquetería `caret`. Obtuvimos que **`max depth = 4`** y **`nrounds = 5300`**. El proceso buscó encontrar el resto de hiper parámetros; sin embargo, únicamente colocamos las gráficas de los parámetros requeridos en el ejercicio. 
+
+- **Max_Depth** 
+![Max_Depth](C:/Users/mario/OneDrive/ITAM/2DO SEMESTRE/Economia Computacional/Tareas/Tarea2/max_depth.png "Max Depth")
+
+- **nrounds & eta**
+![nrounds](C:/Users/mario/OneDrive/ITAM/2DO SEMESTRE/Economia Computacional/Tareas/Tarea2/ntrees_eta.png "nrounds")
+
+```{r xgb-tunning, echo = TRUE, warning = FALSE, eval = FALSE}
+tuneplot <- function(x, probs = .10) {
+  ggplot(x) +
+    coord_cartesian(ylim = c(quantile(x$results$Accuracy, probs = probs), 
+                             max(x$results$Accuracy))) +
+    theme_bw()
+}
+
+tune_grid <- expand.grid(
+  nrounds = seq(from = 200, to = 1000, by = 50),
+  eta = c(0.025, 0.05, 0.1, 0.3),
+  max_depth = c(2, 4, 6, 8, 10), # 2,4,6,8,10
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = 1,
+  subsample = 1
+)
+
+tune_control <- caret::trainControl(
+  method = "cv", # cross-validation
+  number = 3, # with n folds 
+  #index = createFolds(tr_treated$Id_clean), # fix the folds
+  verboseIter = FALSE, # no training log
+  allowParallel = TRUE # FALSE for reproducible results 
+)
+
+Model_xgboost<-caret::train(churn~.,data = data_training_tree[,-c(1)], 
+                            method = 'xgbTree', 
+                            trControl=tune_control, 
+                            tuneGrid = tune_grid,
+                            verbose = TRUE)
+
+tune_grid2 <- expand.grid(
+  nrounds = seq(from = 50, to = 1000, by = 50),
+  eta = Model_xgboost$bestTune$eta,
+  max_depth = ifelse(Model_xgboost$bestTune$max_depth == 2,
+    c(Model_xgboost$bestTune$max_depth:4),
+    Model_xgboost$bestTune$max_depth - 1:Model_xgboost$bestTune$max_depth + 1),
+  gamma = 0,
+  colsample_bytree = 1,
+  min_child_weight = c(1, 2, 3),
+  subsample = 1
+)
+
+Model_xgboost2 <-caret::train(churn~.,data = data_training_tree[,-c(1)], 
+                              method = 'xgbTree', 
+                            trControl=tune_control, 
+                            tuneGrid = tune_grid2,
+                            verbose = TRUE)
+
+tune_grid3 <- expand.grid(
+  nrounds = seq(from = 50, to = 1000, by = 50),
+  eta = Model_xgboost$bestTune$eta,
+  max_depth = Model_xgboost2$bestTune$max_depth,
+  gamma = 0,
+  colsample_bytree = c(0.4, 0.6, 0.8, 1.0),
+  min_child_weight = Model_xgboost2$bestTune$min_child_weight,
+  subsample = c(0.5, 0.75, 1.0)
+)
+
+Model_xgboost3 <-caret::train(churn~.,data = data_training_tree[,-c(1)], 
+                              method = 'xgbTree', 
+                            trControl=tune_control, 
+                            tuneGrid = tune_grid3,
+                            verbose = TRUE)
+
+tune_grid4 <- expand.grid(
+  nrounds = seq(from = 50, to = 1000, by = 50),
+  eta = Model_xgboost$bestTune$eta,
+  max_depth = Model_xgboost2$bestTune$max_depth,
+  gamma = c(0, 0.05, 0.1, 0.5, 0.7, 0.9, 1.0),
+  colsample_bytree = Model_xgboost3$bestTune$colsample_bytree,
+  min_child_weight = Model_xgboost2$bestTune$min_child_weight,
+  subsample = Model_xgboost3$bestTune$subsample
+)
+
+Model_xgboost4 <-caret::train(churn~.,data = data_training_tree[,-c(1)], 
+                              method = 'xgbTree', 
+                            trControl=tune_control, 
+                            tuneGrid = tune_grid4,
+                            verbose = TRUE)
+
+tune_grid5 <- expand.grid(
+  nrounds = seq(from = 100, to = 10000, by = 100),
+  eta = c(0.01, 0.015, 0.025, 0.05, 0.1),
+  max_depth = Model_xgboost2$bestTune$max_depth,
+  gamma = Model_xgboost4$bestTune$gamma,
+  colsample_bytree = Model_xgboost3$bestTune$colsample_bytree,
+  min_child_weight = Model_xgboost2$bestTune$min_child_weight,
+  subsample = Model_xgboost3$bestTune$subsample
+)
+
+Model_xgboost5 <-caret::train(churn~.,data = data_training_tree[,-c(1)], 
+                              method = 'xgbTree', 
+                            trControl=tune_control, 
+                            tuneGrid = tune_grid5,
+                            verbose = TRUE)
+
+parametros.xgb <- Model_xgboost5$bestTune
+
+save(parametros.xgb, file = 'parametros_xgb.Rdata')
+```
+
+Procedemos a entrenar con los hiperparámetros encontrados. 
+
+```{r xgb-train, echo = TRUE, warning = FALSE}
+load('parametros_xgb.Rdata')
+
+Xs <- 
+  sparse.model.matrix(~. + 0, data = data_training_tree[,-c(1,2)])
+
+y <- data_training_tree$churn
+
+training = xgb.DMatrix(data = Xs, label = y)
+
+labels = factor(data_training_tree$churn, levels = c("0","1"))
+df_train = data_training_tree[,-c(1,2)]
+
+kable((final_grid <- expand.grid(
+  nrounds = parametros.xgb$nrounds,
+  eta = parametros.xgb$eta,
+  max_depth = parametros.xgb$max_depth,
+  gamma = parametros.xgb$gamma,
+  colsample_bytree = parametros.xgb$colsample_bytree,
+  min_child_weight = parametros.xgb$min_child_weight,
+  subsample = parametros.xgb$subsample
+)), caption = "Parámetros XGBoost")
+```
+
+```{r xgb-train2, echo = TRUE, warning = FALSE, eval = FALSE}
+xgb <- xgboost(data = data.matrix(df_train), 
+ label = as.numeric(labels)-1, 
+ eta = parametros.xgb$eta,
+ max_depth = parametros.xgb$max_depth, 
+ nround=parametros.xgb$nrounds, 
+ subsample = parametros.xgb$subsample,
+ colsample_bytree = parametros.xgb$colsample_bytree,
+ seed = 156940,
+ eval_metric = "auc",
+ verbose = 1, 
+ objective = "binary:logistic")
+gc()
+save(xgb, file = "xgb_model.Rdata")
+```
+
+## Importancia de Variables XGBoost
+Podemos ver que la variable más importance sigue siendo `eqpdays`. Sin embargo hay ligeros cambios dentro del topo de variables. (e.g. `Mou` pasa a 4do y `changem` a 3ro) pero las variables más importantes se respetan en ambos modelos. El cambio más notable será para la variable recchrge que entrá al top 5.
+
+Una cosa que sí es importante resaltar es que parece que la importancia entre variables está mejor distribuida en el RF, mientras que en el XGB el top 4 resalta del resto. 
+
+```{r xgb-importance, echo = TRUE, warning = FALSE, fig.cap = "Variable Importance XGBoost"}
+load("xgb_model.Rdata")
+importance_matrix <- xgb.importance(model = xgb)
+# Nice graph
+xgb.plot.importance(importance_matrix[1:15,])
+```
+
+### Predicted Values (XGB)
+```{r xgb-predicted, echo = TRUE, warning = FALSE}
+df_eval$xgb <- predict(xgb, 
+                       newdata = data.matrix(data_test_tree[,-c(1,2,69)]))
+kable(head(df_eval,n=5), caption = "Tabla de predicciones")
+```
+
+
+# Evaluación de Modelos
+
+## (4pts) ROC
+De acuerdo a las gráficas podemos decir que el mejor modelo está entre el entrenado mediante `Random Forest` o `XGBoost`
+```{r curva-roc, echo = TRUE, warning = FALSE}
+df_eval$churn <- factor(df_eval$churn, levels = c("1","0"))
+roc_curve_lasso <- roc_curve(df_eval, churn, lasso)
+gg_lasso <- ggplot(roc_curve_lasso, 
+                   aes(x = 1-specificity, y = sensitivity)) +
+                   geom_abline(lty=3, linetype = "dashed") +
+                   geom_path()+coord_equal()+theme_bw()+
+                   labs(title = "ROC Lasso - AUC 0.611")
+
+roc_curve_tree <- roc_curve(df_eval, churn, prob_tree)
+gg_tree <- ggplot(roc_curve_tree, 
+                  aes(x = 1-specificity, y = sensitivity)) +
+                  geom_abline(lty=3, linetype = "dashed") +
+                  geom_path()+coord_equal()+theme_bw()+
+                   labs(title = "ROC Tree - AUC 0.575")
+
+roc_curve_rf <- roc_curve(df_eval, churn, rf)
+gg_rf <- ggplot(roc_curve_rf, 
+                aes(x = 1-specificity, y = sensitivity)) +
+                geom_abline(lty=3, linetype = "dashed") +
+                geom_path()+coord_equal()+theme_bw()+
+                   labs(title = "ROC RF - AUC 0.663")
+
+roc_curve_xgb <- roc_curve(df_eval, churn, xgb)
+gg_xgb <- ggplot(roc_curve_xgb, 
+                 aes(x = 1-specificity, y = sensitivity)) +
+                 geom_abline(lty=3, linetype = "dashed") +
+                 geom_path()+coord_equal()+theme_bw()+
+                   labs(title = "ROC XGB - AUC 0.675")
+
+gg_lasso+gg_tree+gg_rf+gg_xgb
+```
+
+## AUC
+El modelo que tiene la mejor `AUC` es el de `XGBoost`.
+```{r auc, echo = TRUE, warning = FALSE}
+modelos <- c("Lasso", "Tree", "RF", "XGB")
+aucs <- c(round(roc_auc(df_eval, churn, lasso)$.estimate,3),
+          round(roc_auc(df_eval, churn, prob_tree)$.estimate,3),
+          round(roc_auc(df_eval, churn, rf)$.estimate,3),
+          round(roc_auc(df_eval, churn, xgb)$.estimate,3))
+tabla_auc <- cbind(modelos, aucs)
+names(tabla_auc) <- c("Modelos", "AUC")
+kable(tabla_auc, caption = "Modelo - AUC")
+```
+
+## (2 pts) Precision Recall 
+Todos los modelos lo hacen bastante mal respecto a este indicador, esperaríamos que mantuviera un "nivel" alto mientras más avanza respecto al eje x `recall`. Si tuvieramos que escoger por vista el `Tree` pareciera que es el mejor lo hace, sin embargo procederemos a calcular las matrices de confusión para cada uno dándole prioridad a *recall* sobre *specificity* dado que ya se mencionó cuál es el error más importante.  
+```{r precission-recall2, echo = TRUE, warning = FALSE}
+pr_curve_lasso <- pr_curve(df_eval, churn, lasso)
+a <- pr_auc(df_eval, churn, lasso)
+gg_prlasso <- ggplot(pr_curve_lasso, 
+                   aes(y = precision, x = recall)) +
+                   geom_line()+theme_bw()+
+                   labs(title = "PR Lasso - AUC 0.365")
+
+pr_curve_tree <- pr_curve(df_eval, churn, prob_tree)
+b <- pr_auc(df_eval, churn, prob_tree)
+gg_prtree <- ggplot(pr_curve_tree, 
+                  aes(y = precision, x = recall)) +
+                  geom_line()+theme_bw()+
+                   labs(title = "PR Tree - AUC 0.547")
+
+pr_curve_rf <- pr_curve(df_eval, churn, rf)
+c <- pr_auc(df_eval, churn, rf)
+gg_prrf <- ggplot(pr_curve_rf, 
+                aes(y = precision, x = recall)) +
+                geom_line()+theme_bw()+
+                   labs(title = "PR RF - AUC 0.422")
+
+pr_curve_xgb <- pr_curve(df_eval, churn, xgb)
+d <- pr_auc(df_eval, churn, xgb)
+gg_prxgb <- ggplot(pr_curve_xgb, 
+                 aes(y = precision, x = recall)) +
+                 geom_line()+theme_bw()+
+                   labs(title = "PR XGB - 0.443")
+
+gg_prlasso+gg_prtree+gg_prrf+gg_prxgb
+```
+
+## (2pts) Matriz de confusión (Basada en ROC)
+El error más pernicioso será el de **Falsos Negativos** i.e. Real = 1 (Churned) y predices 0 (No churned) ¿Por qué? porque el que el cliente se vaya te hará perder dinero y no podrás identificar la causa raíz del abandono y podrías estar enfocando esfuerzos en cosas incorrectas que te generarán costo y resultados prácticamente nulos. 
+
+Escogimos ese punto dado que le da una mayor preferencia a la *sensibilidad* pero siendo todavía un poco mejor que un volado para la *especificidad* (misma lógica para los siguientes) 
+
+Creamos matriz de confusión para cada modelo basado en un corte óptimpo para cada uno. 
+
+```{r pr-auc, echo = TRUE, warning = FALSE}
+df_eval <- 
+  df_eval %>%
+  dplyr::mutate(., 
+                lasso_pred = ifelse(lasso>=0.4911220,1,0),
+                tree_pred = ifelse(prob_tree>=0.5730412,1,0),
+                rf_pred = ifelse(rf>=0.4894233,1,0),
+                xgb_pred = ifelse(xgb>=0.4783178,1,0),
+                churn = factor(churn, levels = c("0","1")))
+kable(table(df_eval$lasso_pred, df_eval$churn), 
+      caption = "Lasso-Corte: 0.4911")
+kable(table(df_eval$tree_pred, df_eval$churn), 
+      caption = "Tree-Corte:0.5730")
+kable(table(df_eval$rf_pred, df_eval$churn), 
+      caption = "RF-Corte:0.4894")
+kable(table(df_eval$xgb_pred, df_eval$churn), 
+      caption = "XGB-Corte:0.4783")
+
+Sensitivity <- c(round(2386/3977,3), round(2631/3977,3), 
+                 round(2714/3977,3), round(2807/3977,3))
+Specificity <- c(round(5638/10132,3), round(4958/10132,3), 
+                 round(5574/10132,3), round(5573/10132,3))
+Accuracy <- c(round((5638+2386)/(14109),3),
+              round((4958+2631)/(14109),3),
+              round((5574+2714)/(14109),3),
+              round((5573+2807)/(14109),3))
+models <- c("Lasso","Tree","RF","XGB")
+comparativo <- cbind(modelos, Sensitivity, Specificity, Accuracy)
+names(comparativo) <- c("Modelos", "Sensibilidad", "Especificidad","Accuracy")
+
+kable(comparativo, caption = "Comparativo entre modelos")
+```
+
+## (4pts) Lift table
+Interpretarse como el porcentaje de relación de ganancia de seleccionar con tu modelo en un nivel de población dado (e.g. 20 grupos, 5% de tu población c/u). En el grupo 2 para XGB tenemos 1.9 que significa que al seleccionar el 10% de los datos basados en el modelo, esperaríamos obtener 1.9 veces más (el doble) de positivo reales (churned) que al seleccionar el 10% al azar de los datos sin modelo. (E.g de 100 personas si escogemos 10, esperaríamos capturar el doble de positivos reales basándonos en el modelo que sin él)
+
+Linea con puntos = Modelo; Linea continua = Azar 
+```{r lift-table, echo = TRUE, warning = FALSE}
+lift <- function(depvar, predcol, groups=20) {
+if(!require(dplyr)){
+  install.packages("dplyr")
+library(dplyr)}
+if(is.factor(depvar)) depvar <- as.integer(as.character(depvar))
+if(is.factor(predcol)) predcol <- as.integer(as.character(predcol))
+helper = data.frame(cbind(depvar, predcol))
+helper[,"bucket"] = ntile(-helper[,"predcol"], groups)
+gaintable = helper %>% group_by(bucket)  %>%
+  summarise_at(vars(depvar), funs(total = n(),
+  totalresp=sum(., na.rm = TRUE))) %>%
+  mutate(Cumresp = cumsum(totalresp),
+  Gain=Cumresp/sum(totalresp)*100,
+  Cumlift=Gain/(bucket*(100/groups)))
+return(gaintable)
+}
+
+df_eval_lasso <- df_eval[order(df_eval$lasso, decreasing =TRUE),]
+dt = lift(df_eval_lasso$churn , df_eval_lasso$lasso, groups = 20)
+
+gg_liftlasso <- ggplot(dt, 
+                   aes(y = Cumlift, x = bucket)) +
+                   geom_line()+geom_point()+theme_bw()+
+                   geom_hline(yintercept = 1)+
+                   labs(title = "Lift Lasso")
+
+df_eval_tree <- df_eval[order(df_eval$prob_tree, decreasing =TRUE),]
+dt_tree = lift(df_eval_tree$churn , df_eval_tree$prob_tree, groups = 20)
+gg_lifttree <- ggplot(dt_tree, 
+                   aes(y = Cumlift, x = bucket)) +
+                   geom_line()+geom_point()+theme_bw()+
+                   geom_hline(yintercept = 1)+
+                   labs(title = "Lift Tree")
+
+df_eval_rf <- df_eval[order(df_eval$rf, decreasing =TRUE),]
+dt_rf = lift(df_eval_rf$churn , df_eval_rf$rf, groups = 20)
+gg_liftrf <- ggplot(dt_rf, 
+                   aes(y = Cumlift, x = bucket)) +
+                   geom_line()+geom_point()+theme_bw()+
+                   geom_hline(yintercept = 1)+
+                   labs(title = "Lift RF")
+
+df_eval_xgb <- df_eval[order(df_eval$xgb, decreasing =TRUE),]
+dt_xgb = lift(df_eval_xgb$churn , df_eval_xgb$xgb, groups = 20)
+gg_liftxgb <- ggplot(dt_xgb, 
+                   aes(y = Cumlift, x = bucket)) +
+                   geom_line()+geom_point()+theme_bw()+
+                   geom_hline(yintercept = 1)+
+                   labs(title = "Lift XGB")
+
+gg_liftlasso+gg_lifttree+gg_liftrf+gg_liftxgb
+```
+
+## (4pts) Construye un Gain table
+`Gain` es el porcentaje de objetivos (Churn) reales que quedan cubiertos dado cierto porcentaje de la población (e.g. 20 grupos, 5% c/u). Por ejemplo, en XGB para el grupo 7 **(35% de la población) tenemos un `Gain` de 51.5**, eso significa que el 51.5% de la población objetivo se encuentra en el 35% de la población basándonos en el modelo, es decir, podremos identificar el 50% de los individuos que son propensos a cancelar el servicio únicamente enfocándonos en el 35% del **total de clientes**. Esto ahorrará recursos.
+
+Linea con puntos = Modelo; Linea continua = Azar 
+```{r gain-table, echo = TRUE, warning=FALSE}
+dt <- 
+  dplyr::mutate(dt, poblacion = bucket*100/20)
+dt_tree <- 
+  dplyr::mutate(dt_tree, poblacion = bucket*100/20)
+dt_rf <- 
+  dplyr::mutate(dt_rf, poblacion = bucket*100/20)
+dt_xgb <- 
+  dplyr::mutate(dt_xgb, poblacion = bucket*100/20)
+gg_gainlasso <- ggplot(dt, 
+                   aes(y = Gain, x = poblacion)) +
+                   geom_line()+geom_point()+theme_bw()+
+                   geom_abline(intercept = 0, slope = 1)+
+                   labs(title = "Gain Lasso", x = "%Pob")
+
+gg_gaintree <- ggplot(dt_tree, 
+                   aes(y = Gain, x = poblacion)) +
+                   geom_line()+geom_point()+theme_bw()+
+                   geom_abline(intercept = 0, slope = 1)+
+                   labs(title = "Gain Tree", x = "%Pob")
+
+gg_gainrf <- ggplot(dt_rf, 
+                   aes(y = Gain, x = poblacion)) +
+                   geom_line()+geom_point()+theme_bw()+
+                   geom_abline(intercept = 0, slope = 1)+
+                   labs(title = "Gain RF", x = "%Pob")
+
+gg_gainxgb <- ggplot(dt_xgb, 
+                   aes(y = Gain, x = poblacion)) +
+                   geom_line()+geom_point()+theme_bw()+
+                   geom_abline(intercept = 0, slope = 1)+
+                   labs(title = "Gain XGB", x = "%Pob")
+
+gg_gainlasso+gg_gaintree+gg_gainrf+gg_gainxgb
+```
+
+## (2pts) Calcula el AUC Gain del mejor modelo (XGB)
+Para calcularlo modificamos el eje x para que su escala sea del 0 al 1. Esto nos ayudará a la interpretación. Nuestra AUC de gain es menor al AUC de ROC dado que Gain se enfoca en los casos positivos (1). Si utilizamos el azar, 50% de detectar caso positivo viendo al total de tu población, mientras que con el modelo esto aumenta 12pp.(AUC 62.3)
+```{r auc-gain, echo = TRUE, warning=FALSE}
+dt_xgb <- 
+  dplyr::mutate(dt_xgb, poblacion = bucket/20)
+ggplot(dt_xgb, 
+                   aes(y = Gain, x = poblacion)) +
+                   geom_line()+geom_point()+theme_bw()+
+                   labs(title = "Gain XGB - AUC 62.3")
+(AUC_gain_XGB = trapz(dt_xgb$poblacion,dt_xgb$Gain))
+```
+
+# Conclusiones
+El valor predictivo a *total* de nuestro modelo no es tan bueno como quisieramos, el mejor modelo *XGB* tiene un `AUC ROC = 0.675`, es deseable al menos alcanzar un valor de 0.7; sin embargo, los insights compartidos en la parte final son muy relevantes, ya que si bien el poder predictivo deja un poco que desear la parte de negocio es muy valiosa ya que nos ayudará a accionar y enfocar recursos en población específica teniendo un buen desempeño 
+
+Asimismo la parte de las variables de importancia van muy relacionadas a la parte de "lealtad" por lo que también es un buen indicativo de qué camino seguir una vez que tengamos la población seleccionada (e.g. campañas de lealtad, beneficios por mantener cuenta cierto tiempo, etc).
+
+Por lo tanto concluimos que principalmente se utilizaría el modelo para seleccionar a la población y enfocar esfuerzos de una manera estratégica para reducir costos y aumentar resultados en medida de lo posible. 
