@@ -1,0 +1,438 @@
+---
+title: "Tarea 1 - Economía Computacional"
+author: "Grupo 5 (Luis, Mario, Pablo, Raymundo)"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+header-includes:
+  - \usepackage{placeins}
+  - \usepackage{rotating}
+output: 
+  pdf_document:
+    toc: TRUE
+    toc_depth: 3
+    number_sections: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	fig.height = 4,
+	fig.width = 6,
+	message = FALSE,
+	warning = FALSE,
+	cache = FALSE,
+	digits = 3,
+	width = 48
+)
+
+knitr::knit_hooks$set(plot = function(x, options)  {
+  paste0(knitr::hook_plot_tex(x, options), "\n\\FloatBarrier\n")
+})
+```
+
+```{r liberias , include=FALSE}
+library(tidyverse)
+library(RCT)
+library(knitr)
+library(lfe)
+library(broom)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+library(bootstrap)
+library(sandwich)
+library(equatiomatic)
+library(car)
+library(stargazer)
+library(quantreg)
+library(caret)
+library(patchwork)
+library(fuzzySim)
+```
+
+# Limpieza de datos
+```{r carga-de-datos}
+rm(list=ls())
+# Carga de base de datos
+wd <- "C:/Users/mario/OneDrive/ITAM/2DO SEMESTRE/Economia Computacional/eco-compu"
+setwd(wd)
+base <- fread(paste0(wd, "/archivos/BenAndJerry.csv"))
+set.seed(156940)
+```
+
+
+## Preguntas 1-3: Columnas, ID, NAs
+Para simplificar, presentamos una sola tabla que muestra el total de nuestras columnas en conjunto con el número de observaciones únicas para cada una de ellas. Si el identificador fuera único el conteo debería de ser igual al número de observaciones en nuestra base, lo que no sucede. 
+
+La base está a nivel item-cliente, dado que no encontramos una llave única creamos la columna **Key_ID** que será la variable que define de manera única a nuestra base. Asimismo, colocamos el porcentaje de "NA" por columna (0-1).
+```{r pregunta1y2y3, results='asis'}
+# Creamos la llave única
+base <- 
+  base %>% 
+  group_by(household_id) %>% 
+  mutate(key_id=paste(household_id,"-",num=row_number(),sep="")) %>% 
+  ungroup()
+
+df_id <- tibble(
+  columnas <- names(base),
+  type <- sapply(base, class),
+  n_distinct <- sapply(base, n_distinct),
+  n_rows <- sapply(base, length),
+  n_na <- t(base %>%
+  summarise_all(~ round(sum(is.na(.))/length(.),3)))
+)
+
+names(df_id) <- c("Name", "Type", "N_Distinct","N_rows","Perc_NA")
+kable(as.data.frame(df_id))
+```
+\FloatBarrier
+
+## Pregunta 4. Manejo de NAs
+Encontramos 4 columnas con valores "NA". 
+
+- **promotion_type**: sustituiremos por valor 0, entendiendo que hace referencia a las compras que se llevan a cabo sin algún tipo de promoción/oferta. Corroboramos esto dado que la columna "price_paid_deal" es 0 para estos casos. 
+- **female_head_occupation**: sustituiremos por valor 0, entendiendo que hace referencia a una ocupación englobada en "Otros" o "Sin ocupación". También puede ser el caso que en ese hogar no haya un individuo femenino, se corrobora comparando con columnas como "age_of_female_head" donde estos registros también contienen 0 en esta columna. 
+- **scantrack_market_identifier**: sustituiremos por valor 0, entendiendo que hace referencia a un market identifier génerico. Si bien no tenemos contexto sobre el significado de esta variable entendemos que puede tener relación con un aspecto geográfico que apoyado con otras columnas del mismo tipo (e.g. region) podremos identificar si este supuesto es incorrecto
+- **tv_items**: sustituiremos por valor 0, entendiendo que hace referencia a no tener Televisión en el hogar
+
+```{r pregunta4}
+base <- base %>% 
+  mutate(female_head_occupation=ifelse(is.na(female_head_occupation),0,female_head_occupation),
+         promotion_type=ifelse(is.na(promotion_type),0,promotion_type),
+         tv_items=ifelse(is.na(tv_items),0,tv_items),
+         scantrack_market_identifier=ifelse(is.na(scantrack_market_identifier),0,scantrack_market_identifier))
+#base[is.na(base)] <- 0
+```
+
+## Pregunta 5 y 6. Tabla de estadísticas (Cuantiles, Promedio, Mín, Máx, N)
+En la tabla incluimos una columna para identificar las variables "númericas" que creemos que en realidad son categóricas dado los resultados (to_factor). Por temas de visualización la variable *household_id* fue eliminada de la tabla, entendiendo que hace referencia al número de registro asociado a un/unos compradores esta variable también será categórica. 
+
+```{r pregunta5y6, results="asis"}
+variables <- select_if(base, is.numeric) %>%
+  dplyr::select(., -c(household_id))
+
+tabla5 <- summary_statistics(variables)
+
+columnas_factor <- c("promotion_type","household_id","age_of_female_head","age_of_male_head","age_and_presence_of_children",
+                     "male_head_employment","female_head_employment","male_head_education","female_head_education",
+                     "marital_status","male_head_occupation","female_head_occupation","household_composition","race",
+                     "hispanic_origin","region","scantrack_market_identifier","fips_state_code","fips_county_code",
+                     "type_of_residence","household_internet_connection","household_income"
+                     )
+
+tabla5 <- as.data.frame(tabla5) %>% 
+  dplyr::mutate(., to_factor = ifelse(variable %in% columnas_factor, "YES","NO"))
+
+stargazer(as.data.frame(tabla5), type = "latex", summary = FALSE, float.env = "sidewaystable", font.size = "footnotesize", header = FALSE, title="Tabla de estadísticas")
+```
+\FloatBarrier
+
+## Pregunta 7: Distribuciones
+Adjuntamos algunas gráficas que se nos hicieron interesantes. 
+
+- **Edades**: previamente en la tabla de estadísticas observamos que los valores son muy bajos, por lo que decidimos pasarla a factor dado que pareciera indicar un "rango de edad". Observamos que hay muchos valores en cero, lo que parece indicar que en esa familia no hay jefe de familia masculino/femenino dependiendo el caso. Esto se ve reflejado en el histograma de ocupaciones. 
+- **Cupón**: indica que aunque vemos un buen número de transacciones con promoción, no necesariamente esa promoción va acompañado de un descuento de manera "directa" 
+```{r pregunta7, fig.cap = "Distribuciones de variables de interés"}
+base_aux <- base
+base_aux$age_of_female_head <- as.numeric(base_aux$age_of_female_head)
+base_aux$age_of_male_head <- as.numeric(base_aux$age_of_male_head)
+base_aux$female_head_occupation <- as.numeric(base_aux$female_head_occupation)
+base_aux$male_head_occupation <- as.numeric(base_aux$male_head_occupation)
+
+base_aux %>% 
+  dplyr::select(price_paid_deal,price_paid_non_deal,coupon_value,household_income,age_of_female_head,age_of_male_head,male_head_occupation,female_head_occupation) %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value)) +
+    facet_wrap(~ key, scales = "free") +
+    geom_histogram()
+```
+\FloatBarrier
+
+
+## Pregunta 8. Precio total pagado y Precio unitario
+```{r pregunta8}
+base <- 
+  base %>%
+  dplyr::mutate(., 
+                precio_pagado = (price_paid_deal+price_paid_non_deal)-coupon_value,
+                precio_unitario = precio_pagado/quantity)
+```
+
+
+
+# Exploración de los datos 
+
+## Pregunta 9. Histograma Precio unitario-Cantidad demandada
+Para realizar el gráfico realizamos el cálculo de items vendidos por precio unitario, no por transacción. (21,974 observaciones originales -> 28,169 items vendidos)
+```{r Pregunta9, fig.cap = "Histograma: Precio Unitario-Items. Pregunta 9"}
+library(patchwork)
+q_p <- 
+  base %>%
+  group_by(., quantity, precio_unitario) %>%
+  tally() %>% ungroup() %>%
+  dplyr::mutate(., q_total = quantity*n) %>%
+  dplyr::group_by(., precio_unitario) %>%
+  dplyr::summarise(., items = sum(q_total))
+
+df_seq <- c()
+#i <- 1
+for (i in 1:length(q_p$precio_unitario)) {
+  df_aux <- as.data.frame(rep.int(q_p$precio_unitario[i], q_p$items[i]))
+  names(df_aux) <- "precio"
+  df_seq <- rbind(df_seq, df_aux)
+}
+
+plot_cantidad <- ggplot(df_seq, aes(x=precio))+
+  geom_histogram(color="darkblue", fill="lightblue") + 
+  labs(x = "Precio Unitario (p)", y = "Items vendidos (q)", title = "Distribución Precio Unitario")
+
+plot_cantidad
+```
+\FloatBarrier
+
+## Pregunta 10 y 11: Grafica la $q(p)$ y $log(p+1)$ y $log(q+1)$
+La relación q vs. p parece tener un comportamiento lineal.
+```{r pregunta10y11, fig.cap = "Gráficas de dispersión. Pregunta 10 y 11"}
+grafica_qp <- ggplot(base, aes(x = precio_unitario, y = quantity)) +
+    geom_point(color="darkblue") + #+ geom_smooth(method = lm) + 
+  labs(x = "Precio(p)", y = "Cantidad(q)", title = "Gráfica 1: q(p)")
+
+grafica_logqp <- ggplot(base, aes(x = log(precio_unitario+1), y = log(quantity+1))) +
+    geom_point(color="darkblue") + #+ geom_smooth(method = lm) + 
+  labs(x = "Log(p+1)", y = "Log(q+1)", title = "Gráfica 2: q(p) Logaritmica")
+
+grafica_logqp_inv <- ggplot(base, aes(y = log(precio_unitario+1), x = log(quantity+1))) +
+    geom_point(color="darkblue") + geom_smooth(method = lm) + 
+  labs(x = "Log(q+1)", y = "Log(p+1)", title = "Gráfica 3: p(q) Logaritimica")
+
+grafica_qp + grafica_logqp + grafica_logqp_inv
+```
+\FloatBarrier
+
+## Pregunta 12. Grafica la curva de demanda por tamaño del helado
+Con ayuda de las líneas de regresión, podemos observar que en la presentación de **16.0 MLOZ** se presenta de forma más clara una elasticidad negativa dado que a mayor precio menor cantidad demandada. Mientras que, en la presentación de **32.0 MLOZ** este efecto no es tan visible; primero, por que la cantidad de observaciones es menor y segundo, porque diferentes cantidades se suelen comprar al mismo precio.   
+
+```{r pregunta12, fig.cap = "Gráficas de dispersión por tamaño. Pregunta 12"}
+grafica_logqp_size <- ggplot(base, aes(y = log(precio_unitario+1), x = log(quantity+1))) +
+    geom_point(color="darkblue") + geom_smooth(method = lm) + 
+  labs(y = "Log(p+1)", x = "Log(q+1)", title = "q(p) Logaritmica") +
+  facet_wrap(~ size1_descr, scales = "free")
+
+grafica_logqp_size
+```
+\FloatBarrier
+
+## Pregunta 13. Grafica la curva de demanda por sabor. 
+Apoyándonos de las líneas de regresión, se observa que la elasticidad en las cuatro se comporta de manera negativa, es decir, a menor precio se demanda mayor cantidad, sin embargo, entre los cuatro sabores se ven diferencias. El sabor **CHERRY GRCA** y **“Otro”** tienen un comportamiento lineal con una pendiente diferente de cero, por otro lado, las otras dos categorías pareciera ser que tienen un comportamiento similar teniendo una pendiente cercana a cero.
+
+```{r pregunta13, fig.cap = "Gráfica de dispersión por sabor. Pregunta 13"}
+top_sabores <- 
+  base %>% 
+  dplyr::group_by(flavor_descr) %>% 
+  dplyr::summarise(piezas=sum(quantity)) %>% 
+  dplyr::arrange(desc(piezas))
+
+base <- base %>% 
+  dplyr::mutate(group_helado=ifelse(flavor_descr %in% as.vector(top_sabores$flavor_descr[1:3]),flavor_descr,"Otro"))
+
+grafica_logqp_flavor <- ggplot(base, aes(y = log(precio_unitario+1), x = log(quantity+1))) +
+    geom_point(color="darkblue") + geom_smooth(method = lm) + 
+  labs(y = "Log(p+1)", x = "Log(q+1)", title = "q(p) Logaritmica") +
+  facet_wrap(~ group_helado, scales = "free") 
+
+grafica_logqp_flavor
+```
+\FloatBarrier
+
+# Estimación
+
+## Pregunta 14. Estima la regresión de la curva de demanda de los helados. Reporta la tabla de la regresión
+
+La regresión para estimar la curva de demanda se realizó considerando como variable dependiente log(quantity +1) y como variable explicativa log(precio_unitario + 1) así como el resto de los regresores consdierados en la base.
+
+Muchas de las variables numéricas parecen ser en realidad variables categóricas así que las convertimos a factores. 
+
+```{r pregunta14}
+# Varaibles que vamos a quitar
+base$female_head_birth<-NULL
+base$male_head_birth<-NULL
+base$key_id<-NULL
+base$precio_pagado<-NULL
+base$group_helado<-NULL
+base$fips_county_code<-NULL
+base$fips_state_code<-NULL
+base$household_id<-NULL
+base$price_paid_deal<-NULL
+base$price_paid_non_deal<-NULL
+base$coupon_value<-NULL
+base$scantrack_market_identifier<-NULL
+
+# Convertir en logaritmo precio y cantidad 
+base$quantity<-log(base$quantity+1)
+base$precio_unitario<-log(base$precio_unitario+1)
+
+#Convertir en factores algunas variables
+
+var_factors<- c("promotion_type","household_income","age_of_female_head","age_of_male_head","age_and_presence_of_children","male_head_employment","female_head_employment","marital_status","male_head_occupation","female_head_occupation","household_composition","race","hispanic_origin","region","type_of_residence","household_internet_connection","male_head_education","female_head_education")
+
+base[var_factors] <- lapply(base[var_factors], as.factor)
+
+mod1<-lm(data=base, quantity~.)
+
+```
+
+**La regresión contiene las siguientes variables como factores**
+
+promotion_type, household_income, age_of_female_head, age_of_male_head, age_and_presence_of_children, male_head_employment, female_head_employment, marital_status, male_head_occupation, female_head_occupation, household_composition, race, hispanic_origin, region, type_of_residence, household_internet_connection, male_head_education, female_head_education. 
+
+
+**Las siguientes numéricas**
+
+kitchen_appliances, tv_items, household_size
+
+**Omitimos las siguientes variables** 
+
+female_head_birth, male_head_birth, key_id, precio_pagado, group_helado, fips_county_code, fips_state_code, household_id, price_paid_deal, price_paid_non_deal, coupon_value, scantrack_market_identifier. 
+
+
+```{r pregunta14 tabla, results='asis', fig.cap = "La regresión se ejecutó con todas las variables pero se muestra únicamente el coeficiente de precio unitario"}
+stargazer(list(mod1), type = "latex", summary = FALSE, keep = "precio_unitario", header = FALSE,title= "Regresión Completa" )
+
+```
+
+
+## Pregunta 15. F-Test.
+
+Calculamos el estadístico F de la siguiente forma. 
+
+$$
+F = \frac{(TSS - RSS)/k}{RSS/(n-k-1)}
+$$
+```{r calculoF}
+RSS <- sum(residuals(mod1)^2)
+
+y_barra <- mean(base$quantity)
+TSS <- sum((base$quantity - y_barra)^2)
+
+k <- sum(!is.na(mod1$coefficients))-1
+n <- length(base$quantity)
+
+# Nuestro Calculo 
+((TSS-RSS)/k)/(RSS/(n-k-1))
+
+# Comparamos vs. el modelo 
+summary_fit <- summary(mod1)
+F_test <- summary_fit$fstatistic[1] 
+kable(as.data.frame(F_test))
+```
+Enlistamos las variables obtenidas por el modelo. 
+```{r pregunta15}
+# Elementos en modelo 
+nombres_modelo <- names(mod1)
+kable(as.data.frame(nombres_modelo))
+```
+
+
+
+## Pregunta 16. Elasticidad Precio de los Helados
+
+```{r pregunta 16}
+
+#ELSATICIDAD PRECIO DE LOS HELADOS BEN AND JERRY
+elasticidad_precio <- coef(mod1)["precio_unitario"]
+kable(as.data.frame(elasticidad_precio))
+
+```
+
+La elasticidad precio de los helados Ben and Jerry corresponde al coeficiente de la variable log(precio_unitario + 1) estimado con la regresión: `r elasticidad_precio`
+
+El coeficiente sí es estadísticamente significativo a un nivel de significancia de <=1%. Interpretamos este coeficiente como caeteris paribus un incremento de 1% en el precio unitario de los helados está relacionado a un decremento del 3.25% en la cantidad demandada 
+
+## Pregunta 17. Histograma p-values. 
+
+En total se estimaron `r sum(!is.na(mod1$coefficients))` regresores considerando el intercepto, a continuación se muestra el histograma con el p-value asociado a cada una de ellas. 
+
+```{r pregunta17, fig.cap='Histograma de p-values estimados'}
+
+#CALCULO DE P-VALUES
+
+coef_matrix <- coef(mod1)
+vcov_matrix <- vcov(mod1)
+se_matrix <- sqrt(diag(vcov_matrix))
+t_statistics <- coef_matrix / se_matrix
+p_values <- 2 * (1 - pt(abs(t_statistics), df = mod1$df.residual))
+
+length(p_values)
+sum(!is.na(p_values), na.rm = TRUE)
+
+p_values<-as.data.frame(p_values)
+
+ ggplot(p_values, aes(x=p_values))+
+  geom_histogram(color="darkgreen", fill="lightgreen") + 
+  labs(x = "P-Values", y = "Frecuencia Absoluta", title = "Histograma de P-Values")   
+```
+
+
+## Pregunta 18. FDR a una $q=0.10$. Grafica el procedimiento (con y sin zoom-in a p-values<0.05). 
+
+```{r pregunta 18}
+
+#FDR
+FDR_y_HB<-p_values %>%
+  arrange(p_values) %>% 
+  mutate(ranking = seq(1:length(p_values)))
+
+FDR_y_HB$FDR<- .1*FDR_y_HB$ranking/length((FDR_y_HB$ranking))
+FDR_y_HB$FDR_FP<- ifelse(FDR_y_HB$p_values<=FDR_y_HB$FDR,"VP","FP")
+
+sig1<-sum(FDR_y_HB$p_values<=.05,na.rm = TRUE)
+
+sig2<-sum(FDR_y_HB$FDR_FP=="VP",na.rm = TRUE)
+
+
+```
+
+El número de regresores significativos cuando $\alpha<=.05$ es de `r sig1`, mientras que el número de variables significativas bajo el FDR es de `r sig2`.
+
+Ver gráfica en siguiente respuesta. 
+
+## Pregunta 19. Holm-Bonferroni. 
+
+```{r pregunta 19}
+
+#PRUEBA HOLM BONFERRONI
+FDR_y_HB$HB<- .05/(length(FDR_y_HB$ranking)-FDR_y_HB$ranking+1)
+FDR_y_HB$HB_FP<-ifelse(FDR_y_HB$p_values<= FDR_y_HB$HB, "VP", "FP")
+
+ggplot(data=FDR_y_HB, aes(x=ranking,y=p_values))+
+         geom_point(color="black")+ geom_line(aes(y=FDR, color="FDR"))+
+  geom_line(aes(y=HB, color="HB"))+ geom_line(aes(y=.05, color="Alfa .05"))+
+  labs(x = "Ranking", y = "P-Values", title = "FDR y Holm-Bonferroni Sin Zoom")+
+  scale_color_manual(name = "", values = c("FDR" = "darkblue", "HB" = "darkred", "Alfa .05"="darkgreen"))+ theme(legend.position="bottom")
+
+
+
+
+ggplot(data=FDR_y_HB, aes(x=ranking,y=p_values))+
+         geom_point(color="black")+ geom_line(aes(y=FDR, color="FDR"))+
+  geom_line(aes(y=HB, color="HB"))+ geom_line(aes(y=.05, color="Alfa .05"))+
+  labs(x = "Ranking", y = "P-Values", title = "FDR y Holm-Bonferroni Con Zoom")+
+  scale_color_manual(name = "", values = c("FDR" = "darkblue", "HB" = "darkred", "Alfa .05"="darkgreen"))+ theme(legend.position="bottom")+
+  coord_cartesian(ylim=c(0,.05), xlim = c(0,70))
+
+
+
+sig3<-sum(FDR_y_HB$HB_FP=="VP",na.rm = TRUE)
+
+
+     
+
+```
+
+El número de variables significativas bajo el **HB es de `r sig3`.** 
+
+```{r tabladep}
+kable(as.data.frame(FDR_y_HB))  
+```
